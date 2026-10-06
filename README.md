@@ -272,6 +272,15 @@ infra/scripts/teardown.sh --region us-east-1   # limit the check (default: every
 Clean up anything it reports by hand (or re-run the destroy). The tagging API can list a resource
 for a few minutes after deletion, so a lone "tagged resource" line right after a destroy may be stale.
 
+A profile with no default region is fine (it lists regions from `us-east-1`). If any AWS query
+fails (permissions, a region you cannot query) the script prints `CHECK FAILED` with the reason and
+exits non-zero: it never reports "Clean" for an account it could not fully check. Exit codes: 0 clean,
+1 leftovers or failed checks, 2 could not start (no credentials, regions unlistable).
+
+The check covers every enabled region, about 13 AWS calls each, so it runs eight regions at a time
+(`CHECK_JOBS=n` changes that) and prints a line as each one finishes: expect a minute or two, not
+silence. To check only where the harness ran: `--region us-east-1`, which takes seconds.
+
 ### Provision the schema and run the Rails app (local Docker)
 
 ```bash

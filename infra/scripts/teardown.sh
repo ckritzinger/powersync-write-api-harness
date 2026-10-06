@@ -38,8 +38,23 @@ account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null
   exit 2
 }
 if [ ${#REGIONS[@]} -eq 0 ]; then
-  read -r -a REGIONS <<<"$(aws ec2 describe-regions --query 'Regions[].RegionName' --output text)"
+  # describe-regions answers from any region, but the CLI insists on one: use the configured region,
+  # else us-east-1. (A profile without a default region is normal and must not break the script.)
+  bootstrap="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null)}}"
+  bootstrap="${bootstrap:-us-east-1}"
+  regions_text="$(aws ec2 describe-regions --region "$bootstrap" --query 'Regions[].RegionName' --output text)" || {
+    echo "Could not list AWS regions (aws ec2 describe-regions --region $bootstrap failed)." >&2
+    exit 2
+  }
+  read -r -a REGIONS <<<"$regions_text"
 fi
+[ ${#REGIONS[@]} -gt 0 ] || { echo "No regions to check (pass --region <name>)." >&2; exit 2; }
+
+# Failed AWS queries are recorded here (a file, because queries run in $(...) subshells). A query
+# that failed has not looked at anything, so the account must never be reported clean after one.
+FAIL_LOG="$(mktemp)"
+OUT_DIR="" # per-region results, created in the verify step
+trap 'rm -f "$FAIL_LOG"; [ -n "$OUT_DIR" ] && rm -rf "$OUT_DIR"' EXIT
 
 say "Account:  $account"
 say "Scope:    name prefix / Project tag '$NAME'"
@@ -84,42 +99,75 @@ fi
 
 say "== Verifying (read-only)"
 found=0
-# Prints a finding. Arguments: region, kind, tab/newline-separated identifiers (may be empty).
+# Formats findings. Arguments: region, kind, tab/newline-separated identifiers (may be empty).
+emit() {
+  [ -z "$3" ] && return
+  printf '%s\n' "$3" | tr '\t' '\n' | sed '/^$/d' | sed "s/^/  LEFTOVER [$1] $2: /"
+}
+# Same, but for the main shell: also remembers that something was found.
 report() {
   [ -z "$3" ] && return
   found=1
-  printf '%s\n' "$3" | tr '\t' '\n' | sed '/^$/d' | sed "s/^/  LEFTOVER [$1] $2: /"
+  emit "$@"
 }
 tagged() { printf "length(%s[?Key=='Project' && Value=='%s']) > \`0\`" "$1" "$NAME"; }
-q() { aws "$@" --output text 2>/dev/null; }
+# Runs one read-only query and prints its result. A failure prints nothing to stdout, but is reported
+# on stderr and logged, so the verdict below cannot be "clean".
+q() {
+  local err out
+  err="$(mktemp)"
+  if out="$(aws "$@" --output text 2>"$err")"; then
+    printf '%s' "$out"
+  else
+    printf 'CHECK FAILED: aws %s\n    %s\n' "$*" "$(head -n 1 "$err")" >&2
+    printf '%s\n' "$*" >>"$FAIL_LOG"
+  fi
+  rm -f "$err"
+}
 
-for r in "${REGIONS[@]}"; do
-  f="Name=tag:Project,Values=$NAME"
-  report "$r" "RDS instance" "$(q rds describe-db-instances --region "$r" \
+# Every query for one region (about 13 AWS CLI calls). Runs in a background job: it only prints.
+check_region() {
+  local r="$1" f="Name=tag:Project,Values=$NAME"
+  emit "$r" "RDS instance" "$(q rds describe-db-instances --region "$r" \
     --query "DBInstances[?starts_with(DBInstanceIdentifier, '$NAME') || $(tagged TagList)].join(':', [DBInstanceIdentifier, DBInstanceStatus])")"
-  report "$r" "RDS cluster" "$(q rds describe-db-clusters --region "$r" \
+  emit "$r" "RDS cluster" "$(q rds describe-db-clusters --region "$r" \
     --query "DBClusters[?starts_with(DBClusterIdentifier, '$NAME') || $(tagged TagList)].join(':', [DBClusterIdentifier, Status])")"
-  report "$r" "RDS snapshot" "$(q rds describe-db-snapshots --region "$r" --snapshot-type manual \
+  emit "$r" "RDS snapshot" "$(q rds describe-db-snapshots --region "$r" --snapshot-type manual \
     --query "DBSnapshots[?starts_with(DBSnapshotIdentifier, '$NAME') || starts_with(DBInstanceIdentifier, '$NAME')].DBSnapshotIdentifier")"
-  report "$r" "RDS cluster snapshot" "$(q rds describe-db-cluster-snapshots --region "$r" --snapshot-type manual \
+  emit "$r" "RDS cluster snapshot" "$(q rds describe-db-cluster-snapshots --region "$r" --snapshot-type manual \
     --query "DBClusterSnapshots[?starts_with(DBClusterSnapshotIdentifier, '$NAME') || starts_with(DBClusterIdentifier, '$NAME')].DBClusterSnapshotIdentifier")"
-  report "$r" "RDS retained automated backup" "$(q rds describe-db-instance-automated-backups --region "$r" \
+  emit "$r" "RDS retained automated backup" "$(q rds describe-db-instance-automated-backups --region "$r" \
     --query "DBInstanceAutomatedBackups[?starts_with(DBInstanceIdentifier, '$NAME')].join(':', [DBInstanceIdentifier, DbiResourceId])")"
-  report "$r" "RDS subnet group" "$(q rds describe-db-subnet-groups --region "$r" \
+  emit "$r" "RDS subnet group" "$(q rds describe-db-subnet-groups --region "$r" \
     --query "DBSubnetGroups[?starts_with(DBSubnetGroupName, '$NAME')].DBSubnetGroupName")"
-  report "$r" "RDS parameter group" "$(q rds describe-db-parameter-groups --region "$r" \
+  emit "$r" "RDS parameter group" "$(q rds describe-db-parameter-groups --region "$r" \
     --query "DBParameterGroups[?starts_with(DBParameterGroupName, '$NAME')].DBParameterGroupName")"
-  report "$r" "EC2 instance" "$(q ec2 describe-instances --region "$r" --filters "$f" \
+  emit "$r" "EC2 instance" "$(q ec2 describe-instances --region "$r" --filters "$f" \
     Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId')"
-  report "$r" "Elastic IP" "$(q ec2 describe-addresses --region "$r" --filters "$f" --query 'Addresses[].PublicIp')"
-  report "$r" "ECR repository" "$(q ecr describe-repositories --region "$r" \
+  emit "$r" "Elastic IP" "$(q ec2 describe-addresses --region "$r" --filters "$f" --query 'Addresses[].PublicIp')"
+  emit "$r" "ECR repository" "$(q ecr describe-repositories --region "$r" \
     --query "repositories[?starts_with(repositoryName, '$NAME')].repositoryName")"
-  report "$r" "VPC" "$(q ec2 describe-vpcs --region "$r" --filters "$f" --query 'Vpcs[].VpcId')"
-  report "$r" "security group" "$(q ec2 describe-security-groups --region "$r" --filters "$f" --query 'SecurityGroups[].GroupId')"
+  emit "$r" "VPC" "$(q ec2 describe-vpcs --region "$r" --filters "$f" --query 'Vpcs[].VpcId')"
+  emit "$r" "security group" "$(q ec2 describe-security-groups --region "$r" --filters "$f" --query 'SecurityGroups[].GroupId')"
   # Anything else carrying the tag. The tagging API can list resources for a few minutes after
   # deletion, so treat these as hints when nothing above was found.
-  report "$r" "tagged resource (may lag deletion)" "$(q resourcegroupstaggingapi get-resources --region "$r" \
+  emit "$r" "tagged resource (may lag deletion)" "$(q resourcegroupstaggingapi get-resources --region "$r" \
     --tag-filters "Key=Project,Values=$NAME" --query 'ResourceTagMappingList[].ResourceARN')"
+}
+
+# Regions are independent, so check several at once: sequentially this is minutes of silence.
+JOBS="${CHECK_JOBS:-8}"
+OUT_DIR="$(mktemp -d)"
+say "Checking ${#REGIONS[@]} region(s), up to $JOBS at a time (about 13 AWS calls each)..."
+running=0
+for r in "${REGIONS[@]}"; do
+  ( check_region "$r" >"$OUT_DIR/$r.txt"; printf '  [%s] checked\n' "$r" ) &
+  running=$((running + 1))
+  if [ "$running" -ge "$JOBS" ]; then wait; running=0; fi # bash 3.2 (macOS) has no `wait -n`
+done
+wait
+for r in "${REGIONS[@]}"; do
+  [ -s "$OUT_DIR/$r.txt" ] && { found=1; cat "$OUT_DIR/$r.txt"; }
 done
 report global "IAM role" "$(q iam list-roles --query "Roles[?starts_with(RoleName, '$NAME')].RoleName")"
 report global "IAM instance profile" "$(q iam list-instance-profiles \
@@ -132,6 +180,12 @@ done
 if [ "$found" = 1 ] || [ "$destroy_failed" = 1 ]; then
   warn "Harness resources may still exist (listed above). The check deletes nothing;"
   warn "re-run terraform destroy, or remove them in the AWS console / Atlas UI."
+  [ -s "$FAIL_LOG" ] && warn "$(wc -l <"$FAIL_LOG" | tr -d ' ') check(s) also failed (CHECK FAILED above), so the list may be incomplete."
+  exit 1
+fi
+if [ -s "$FAIL_LOG" ]; then
+  warn "$(wc -l <"$FAIL_LOG" | tr -d ' ') check(s) failed (CHECK FAILED above): nothing was found, but the account was NOT fully checked."
+  warn "Fix the cause (credentials, permissions, or a region you cannot query) and re-run, or limit it with --region."
   exit 1
 fi
 say "Clean: no harness resources found."
