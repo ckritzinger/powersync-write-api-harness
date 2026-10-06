@@ -1,0 +1,14 @@
+# Built from the write API's DATABASE_URI (or MONGODB_URI). Unused unless DATABASE_TYPE=mongodb.
+<% if SourceDatabase.mongodb? %>
+default: &default
+  clients:
+    default:
+      uri: <%= SourceDatabase.mongodb_uri %>
+  options:
+    raise_not_found_error: false
+
+development:
+  <<: *default
+production:
+  <<: *default
+<% end %>

@@ -1,0 +1,14 @@
+source "https://rubygems.org"
+
+gem "rails", "~> 8.0.0"
+gem "puma", ">= 6"
+
+# Signs the test JWTs the frontend uses for PowerSync sync and write API requests.
+gem "jwt", "~> 3.1"
+
+# Every engine the write API supports. DATABASE_TYPE picks one at boot; the others stay unloaded.
+gem "pg", "~> 1.5"
+gem "mysql2", "~> 0.5"
+gem "activerecord-sqlserver-adapter", "~> 8.0.0"
+gem "tiny_tds", "~> 3.0"
+gem "mongoid", "~> 9.0"

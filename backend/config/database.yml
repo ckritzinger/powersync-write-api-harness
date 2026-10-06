@@ -1,0 +1,12 @@
+# Built from the write API's DATABASE_TYPE / DATABASE_URI (see lib/source_database.rb).
+# Unused when DATABASE_TYPE=mongodb (ActiveRecord is not loaded).
+<% unless SourceDatabase.mongodb? %>
+default: &default
+  url: <%= SourceDatabase.active_record_url %>
+  pool: 5
+
+development:
+  <<: *default
+production:
+  <<: *default
+<% end %>

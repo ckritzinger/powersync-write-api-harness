@@ -1,0 +1,2 @@
+<h2><%= @orphaned ? "Orphaned todos (list_id matches no list)" : "All todos" %></h2>
+<%= render "todos/table", todos: @todos, show_list: true %>

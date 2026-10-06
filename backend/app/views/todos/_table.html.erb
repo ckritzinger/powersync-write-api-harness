@@ -1,0 +1,24 @@
+<table>
+  <thead>
+    <tr>
+      <th>Position</th><th>Title</th><th>Completed</th>
+      <% if show_list %><th>List</th><% end %>
+      <th>Created</th><th>Updated</th><th>ID</th>
+    </tr>
+  </thead>
+  <tbody>
+    <% todos.each do |todo| %>
+      <% values = stored_attrs(todo) %>
+      <tr>
+        <td class="mono"><%= values["position"].inspect %></td>
+        <td><%= todo.title.nil? ? content_tag(:span, "NULL", class: "bad") : todo.title %></td>
+        <td class="mono"><%= values["completed"].inspect %></td>
+        <% if show_list %><td class="mono"><a href="<%= list_path(todo.list_id) %>"><%= todo.list_id %></a></td><% end %>
+        <td class="mono"><%= show_value(values["created_at"]) %></td>
+        <td class="mono"><%= show_value(values["updated_at"]) %></td>
+        <td class="mono muted"><%= todo.id %></td>
+      </tr>
+    <% end %>
+    <% if todos.empty? %><tr><td colspan="7" class="muted">None.</td></tr><% end %>
+  </tbody>
+</table>

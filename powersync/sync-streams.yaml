@@ -1,0 +1,16 @@
+# Sync Streams (config edition 3) for Postgres / MySQL / SQL Server source databases.
+# `rake connect` deploys this as the instance's sync config (cli/sync-config.yaml). Table and
+# column names must match the source tables exactly (the write API's default mapper preserves names).
+#
+# One stream, subscribed automatically (auto_subscribe), scoped to the signed-in user:
+#   - lists the user owns (owner_id = the token's sub, auth.user_id())
+#   - the todos of those lists (todos has no owner_id, so they follow their list's owner)
+config:
+  edition: 3
+
+streams:
+  user_data:
+    auto_subscribe: true
+    queries:
+      - SELECT * FROM lists WHERE owner_id = auth.user_id()
+      - SELECT * FROM todos WHERE list_id IN (SELECT id FROM lists WHERE owner_id = auth.user_id())

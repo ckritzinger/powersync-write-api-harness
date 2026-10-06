@@ -1,0 +1,668 @@
+# Points the hosted PowerSync Cloud instance at whatever database the harness is currently using,
+# using the PowerSync CLI. Run from this directory (stdlib-only Ruby, runs on the host; the Rails
+# app in backend/ runs in Docker and cannot drive the CLI or your PowerSync login):
+#
+#   rake help        what this does and what you must do by hand
+#   rake connect     provision the DB, generate config, show what would change, ask, deploy
+#   rake plan        everything except the final deploy (CLI dry run)
+#   rake instance    list your PowerSync instances; `rake instance INSTANCE=<id>` writes POWERSYNC_URL
+#                    to backend/.env and frontend/.env (needs the CLI installed and logged in)
+#   rake generate    only write cli/service.yaml and cli/sync-config.yaml (no PowerSync account needed)
+#   rake provision   create tables + PowerSync prerequisites in the database (via backend/ Docker)
+#   rake keys        create the token signing key if needed and print what to copy where
+#   rake write_api   configure the write API checkout (database, trusted key, issuer/audience).
+#                    Everything goes into its gitignored .env.local (the DB password, AUTH_ISSUER/
+#                    AUTH_AUDIENCE); no tracked file is edited. Then start it with `docker compose up`
+#                    in that checkout.
+#   rake status      show the instance's connection/replication status
+#
+# Inputs (environment variables win over the files):
+#   database   DATABASE_TYPE, DATABASE_URI           backend/.env  (same values as the write API)
+#   instance   POWERSYNC_URL (or INSTANCE_ID)        frontend/.env or backend/.env
+#   tokens     JWT_ISSUER, JWT_AUDIENCE (default POWERSYNC_URL)   backend/.env only (the Rails app signs the tokens)
+#   key        keys/jwks.json                         the public signing key, created by the Rails app
+#   switches   YES=1 skip the confirmation, SKIP_PROVISION=1, POWERSYNC_CLI="npx -y powersync@0.10.2"
+abort "powersync/Rakefile needs Ruby 3.0 or newer (this is #{RUBY_VERSION}). macOS's /usr/bin/ruby is too old: use your rbenv/asdf Ruby." if RUBY_VERSION < "3.0"
+require "cgi"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "shellwords"
+require "uri"
+
+HARNESS_ROOT = File.expand_path("..", __dir__)
+HERE = __dir__
+CLI_DIR_NAME = "cli" # the CLI's config directory, relative to HERE
+CLI_DIR = File.join(HERE, CLI_DIR_NAME)
+CACHE_DIR = File.join(HERE, ".cache")
+BACKEND_COMPOSE = File.join(HARNESS_ROOT, "backend", "docker-compose.yaml")
+DEFAULT_PORTS = { "postgres" => 5432, "mysql" => 3306, "mssql" => 1433 }.freeze
+CLI_TYPES = { "postgres" => "postgresql", "mysql" => "mysql", "mssql" => "mssql", "mongodb" => "mongodb" }.freeze
+
+module Harness
+  class Failure < StandardError; end
+  class Aborted < Failure; end
+  Database = Struct.new(:type, :raw_uri, :scheme, :host, :port, :user, :password, :name, :query, keyword_init: true)
+
+  module_function
+
+  def fail!(message)
+    raise(Failure, message)
+  end
+
+  def say(message = "")
+    puts(message)
+  end
+
+  def blank?(value)
+    value.nil? || value.to_s.strip.empty?
+  end
+
+  def yaml(value)
+    JSON.generate(value) # JSON scalars are valid YAML flow scalars
+  end
+
+  def unescape(value)
+    value && CGI.unescape(value)
+  end
+
+  # KEY=VALUE lines like Docker Compose's env_file: values are taken verbatim (quotes removed),
+  # so both tools read the same thing from backend/.env.
+  def dotenv(path)
+    return {} unless File.file?(path)
+    File.readlines(path, chomp: true).each_with_object({}) do |line, env|
+      next if line.strip.empty? || line.lstrip.start_with?("#")
+      key, value = line.split("=", 2)
+      next if value.nil?
+      value = value.strip
+      value = value[1..-2] if value.length >= 2 && value[0] == value[-1] && %w[" '].include?(value[0])
+      env[key.strip.sub(/\Aexport\s+/, "")] = value
+    end
+  end
+
+  def backend_env
+    (@backend_env ||= dotenv(File.join(HARNESS_ROOT, "backend", ".env")))
+  end
+
+  def frontend_env
+    (@frontend_env ||= dotenv(File.join(HARNESS_ROOT, "frontend", ".env")))
+  end
+
+  def get(name, *file_envs)
+    return ENV[name] unless blank?(ENV[name])
+    file_envs.each { |file_env| return file_env[name] unless blank?(file_env[name]) }
+    nil
+  end
+
+  # --- Database -------------------------------------------------------------------------------
+
+  def database
+    @database ||= begin
+      type = get("DATABASE_TYPE", backend_env) || "postgres"
+      fail!("DATABASE_TYPE must be one of #{CLI_TYPES.keys.join(', ')} (got #{type.inspect}).") unless CLI_TYPES.key?(type)
+      # Same override variables the Rails app honours (config/database.yml, config/mongoid.yml).
+      raw = (type == "mongodb" ? get("MONGODB_URI", backend_env) : get("DATABASE_URL", backend_env)) ||
+            get("DATABASE_URI", backend_env)
+      fail!("DATABASE_URI is not set. Put the write API's DATABASE_TYPE/DATABASE_URI in backend/.env.") if blank?(raw)
+      uri = begin
+        URI.parse(raw)
+      rescue URI::InvalidURIError
+        fail!("DATABASE_URI is not a valid URI (percent-encode special characters in the password).")
+      end
+      fail!("DATABASE_URI has no host.") if blank?(uri.host)
+      Database.new(type: type, raw_uri: raw, scheme: uri.scheme, host: uri.host,
+                   port: uri.port || DEFAULT_PORTS[type], user: unescape(uri.user), password: unescape(uri.password),
+                   name: uri.path.to_s.sub(%r{\A/}, ""), query: uri.query)
+    end
+  end
+
+  # PowerSync Cloud connects from the internet: a database only your machine can resolve is useless.
+  def unreachable_from_cloud?(host)
+    host =~ /\A(localhost|127\.|0\.0\.0\.0|\[?::1)/ || !host.include?(".") ||
+      host =~ /\A(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/ || host.end_with?(".local", ".internal")
+  end
+
+  def rds_region(host)
+    host[/\.([a-z0-9-]+)\.rds\.amazonaws\.com\z/, 1]
+  end
+
+  # PowerSync Cloud only speaks verified TLS to Postgres, and the RDS CA is not in public trust
+  # stores, so the CA bundle must travel in the config. Cached under .cache/.
+  def rds_ca_bundle(host)
+    region = rds_region(host) or return nil
+    FileUtils.mkdir_p(CACHE_DIR)
+    cache = File.join(CACHE_DIR, "rds-#{region}-bundle.pem")
+    return File.read(cache) if File.file?(cache)
+    ["https://truststore.pki.rds.amazonaws.com/#{region}/#{region}-bundle.pem",
+     "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"].each do |url|
+      response = Net::HTTP.get_response(URI(url))
+      next unless response.is_a?(Net::HTTPSuccess) && response.body.include?("BEGIN CERTIFICATE")
+      File.write(cache, response.body)
+      return response.body
+    end
+    fail!("Could not download the RDS CA bundle for #{region} (https://truststore.pki.rds.amazonaws.com).")
+  end
+
+  # --- PowerSync instance and client auth ----------------------------------------------------------
+
+  def instance_id
+    id = get("INSTANCE_ID", frontend_env, backend_env) || get("POWERSYNC_INSTANCE_ID", frontend_env, backend_env)
+    url = powersync_url
+    id ||= URI.parse(url).host.to_s.split(".").first if url && url =~ %r{\Ahttps?://[0-9a-f]{24}\.}
+    fail!("Cannot tell which PowerSync instance to use. Set POWERSYNC_URL in frontend/.env or backend/.env " \
+          "(https://<24-hex instance id>.powersync...) or INSTANCE_ID.") unless id =~ /\A[0-9a-f]{24}\z/
+    id
+  end
+
+  def powersync_url
+    get("POWERSYNC_URL", frontend_env, backend_env)
+  end
+
+  # The signing key lives in keys/ (see keys/README.md); the Rails app creates it on first use.
+  def keys_dir
+    File.join(HARNESS_ROOT, "keys")
+  end
+
+  def jwks_file
+    File.join(keys_dir, "jwks.json")
+  end
+
+  # Runs a rake task inside the backend image (Docker Compose, backend/.env). The database
+  # variables are passed so the Rails app boots; the password stays out of argv.
+  def backend_rails(*tasks)
+    fail!("docker is required (the Rails backend runs in Docker).") unless on_path?("docker")
+    fail!("backend/.env is missing; Docker Compose needs it (see backend/.env.example).") unless File.file?(File.join(HARNESS_ROOT, "backend", ".env"))
+    db = database
+    env = { "DATABASE_TYPE" => db.type, "DATABASE_URI" => db.raw_uri }
+    command = %W[docker compose -f #{BACKEND_COMPOSE} run --build --rm -e DATABASE_TYPE -e DATABASE_URI backend bin/rails] + tasks
+    system(env, *command)
+  end
+
+  # Creates keys/ files if needed and prints what to copy where (the Rails keys:generate task).
+  def keys!
+    backend_rails("keys:generate") or fail!("Could not run keys:generate in the backend image.")
+  end
+
+  # The PUBLIC signing key, from keys/jwks.json (created on demand). Never touches the private key.
+  def public_jwk
+    keys! unless File.file?(jwks_file)
+    fail!("keys/jwks.json was not created; see keys/README.md.") unless File.file?(jwks_file)
+    JSON.parse(File.read(jwks_file)).fetch("keys").first.slice("kty", "n", "e", "alg", "kid", "use")
+  end
+
+  def jwt_issuer
+    get("JWT_ISSUER", backend_env) || "write-api-harness"
+  end
+  # What the Rails app puts in `aud`: it only sees backend/.env (via Compose), so read the same place.
+  # The instance's own URL is always accepted by PowerSync, so it is the default.
+  def jwt_audience
+    get("JWT_AUDIENCE", backend_env) || get("POWERSYNC_URL", backend_env)
+  end
+
+  # --- Config generation -----------------------------------------------------------------------
+
+  def connection_lines(db)
+    lines = ["type: #{CLI_TYPES.fetch(db.type)}"]
+    password = ["password:", "  secret: !env POWERSYNC_DATABASE_PASSWORD"]
+    case db.type
+    when "postgres"
+      lines += ["hostname: #{yaml(db.host)}", "port: #{db.port}", "database: #{yaml(db.name)}", "username: #{yaml(db.user)}", *password]
+      lines << "sslmode: verify-full"
+      ca = rds_ca_bundle(db.host)
+      lines << "cacert: #{yaml(ca)}" if ca
+    when "mysql"
+      lines += ["hostname: #{yaml(db.host)}", "port: #{db.port}", "database: #{yaml(db.name)}", "username: #{yaml(db.user)}", *password]
+    when "mssql"
+      lines += ["hostname: #{yaml(db.host)}", "port: #{db.port}", "database: #{yaml(db.name)}", "schema: dbo",
+                "username: #{yaml(db.user)}", *password,
+                "additionalConfig:", "  trustServerCertificate: true"]
+    when "mongodb"
+      # The URI keeps the user but not the password; the password travels as a secret.
+      host_port = db.port ? "#{db.host}:#{db.port}" : db.host
+      uri = "#{db.scheme}://#{CGI.escape(db.user.to_s)}@#{host_port}/#{db.name}#{db.query ? "?#{db.query}" : ''}"
+      lines += ["uri: #{yaml(uri)}", "username: #{yaml(db.user)}", *password, "post_images: auto_configure"]
+    end
+    lines.each_with_index.map { |line, i| i.zero? ? "    - #{line}" : "      #{line}" }
+  end
+
+  def service_yaml(db, name:, region:)
+    jwk = public_jwk
+    lines = [
+      "# Generated by powersync/Rakefile (`rake generate`); edits are overwritten on the next run.",
+      "_type: cloud", "name: #{yaml(name)}", "region: #{yaml(region)}",
+      "replication:", "  connections:", *connection_lines(db),
+      "client_auth:", "  jwks:", "    keys:"
+    ]
+    jwk.each_with_index { |(k, v), i| lines << "      #{i.zero? ? '- ' : '  '}#{k}: #{yaml(v)}" }
+    audience = jwt_audience
+    # The instance's own URL is always an accepted audience; anything else must be listed.
+    if audience && audience.chomp("/") != powersync_url.to_s.chomp("/")
+      lines << "  additional_audiences: [#{yaml(audience)}]"
+    end
+    lines.join("\n") + "\n"
+  end
+
+  def sync_config_path(db)
+    File.join(HERE, db.type == "mongodb" ? "sync-streams.mongodb.yaml" : "sync-streams.yaml")
+  end
+
+  # name/region of the live instance (from `pull instance`) or the previous run; region is fixed
+  # for the life of an instance, so it must not be guessed when it is known.
+  def known_instance_attributes
+    file = File.join(CLI_DIR, "service.yaml")
+    text = File.file?(file) ? File.read(file) : ""
+    pick = ->(key) { text[/^#{key}:\s*["']?([^"'\n#]+?)["']?\s*(#.*)?$/, 1] }
+    [pick.call("name") || "write-api-harness", pick.call("region") || ENV["POWERSYNC_REGION"] || "us", !pick.call("region").nil?]
+  end
+
+  def generate!
+    db = database
+    name, region, region_known = known_instance_attributes
+    FileUtils.mkdir_p(CLI_DIR)
+    File.write(File.join(CLI_DIR, "service.yaml"), service_yaml(db, name: name, region: region))
+    File.write(File.join(CLI_DIR, "sync-config.yaml"), File.read(sync_config_path(db)))
+    say "Wrote #{CLI_DIR_NAME}/service.yaml (#{db.type} #{db.host}) and #{CLI_DIR_NAME}/sync-config.yaml (#{File.basename(sync_config_path(db))})."
+    say "NOTE: region #{region.inspect} is a guess (no live instance config yet); `rake plan` pulls the real one." unless region_known
+  end
+
+  # --- CLI -------------------------------------------------------------------------------------
+
+  def on_path?(program)
+    ENV["PATH"].to_s.split(File::PATH_SEPARATOR).any? { |dir| File.executable?(File.join(dir, program)) }
+  end
+
+  INSTALL_HELP = <<~TEXT.freeze
+    Install the PowerSync CLI and log in:
+      npm install -g powersync
+      powersync login        # opens a browser to create a personal access token
+    (Or export PS_ADMIN_TOKEN=<personal access token> instead of logging in. Docs: https://docs.powersync.com/tools/cli)
+  TEXT
+
+  # The CLI must already be installed; this task never downloads it.
+  def cli_command
+    if !blank?(ENV["POWERSYNC_CLI"]) then ENV["POWERSYNC_CLI"].shellsplit
+    elsif on_path?("powersync") then ["powersync"]
+    else fail!("The PowerSync CLI (`powersync`) is not installed.\n#{INSTALL_HELP}")
+    end
+  end
+
+  # The database password reaches the CLI through the environment (`secret: !env ...` in
+  # service.yaml), never through argv or a file. Commands that do not touch the database (listing
+  # instances) must work before DATABASE_URI is configured, so it is optional here.
+  def cli_env
+    password = begin
+      database.password
+    rescue Failure
+      nil
+    end
+    password ? { "POWERSYNC_DATABASE_PASSWORD" => password } : {}
+  end
+
+  def cli(*args, capture: false)
+    command = cli_command + args
+    if capture
+      output, status = Open3.capture2e(cli_env, *command, chdir: HERE)
+      [status.success?, output]
+    else
+      say "$ #{(cli_command + args).join(' ')}"
+      system(cli_env, *command, chdir: HERE) ? true : false
+    end
+  end
+
+  DEFAULT_POWERSYNC_DOMAIN = "powersync.journeyapps.com".freeze
+  Instance = Struct.new(:id, :name, :project, :org, :configured, :provisioned, keyword_init: true)
+
+  # Instances visible to the logged-in account, via `powersync fetch instances --output=json`.
+  # That command reports problems (no login, no network) as a warning and still exits 0, so the
+  # output has to be inspected, not just the exit status.
+  def cloud_instances
+    ok, output = cli("fetch", "instances", "--output=json", capture: true)
+    clean = output.gsub(/\e\[[0-9;]*[A-Za-z]/, "") # the CLI may colourise its JSON
+    if (m = clean.match(/Failed to fetch cloud instances:?\s*(.*)/))
+      fail!("The PowerSync CLI could not list your instances: #{m[1].strip}\n\nAre you logged in?\n#{INSTALL_HELP}")
+    end
+    fail!("`powersync fetch instances` failed:\n#{clean.lines.first(8).join}\n#{INSTALL_HELP}") unless ok
+    start = clean.index("{") or fail!("Unexpected output from `powersync fetch instances`:\n#{clean.lines.first(8).join}")
+    cloud = begin
+      JSON.parse(clean[start..]).fetch("cloudInstances")
+    rescue JSON::ParserError, KeyError
+      fail!("Could not read the output of `powersync fetch instances` (a newer CLI version?):\n#{clean.lines.first(8).join}")
+    end
+    cloud.values.flat_map do |org|
+      org.fetch("projects", {}).values.flat_map do |project|
+        project.fetch("instances", []).map do |i|
+          Instance.new(id: i["id"], name: i["name"], project: project["name"], org: org["name"],
+                       configured: i["has_config"], provisioned: i["deployable"])
+        end
+      end
+    end
+  end
+
+  def check_login!
+    ids = cloud_instances.map(&:id)
+    fail!("Instance #{instance_id} is not visible to this PowerSync account. Check POWERSYNC_URL and which " \
+          "account `powersync login` used. Visible instances: `rake instance`.") unless ids.include?(instance_id)
+  end
+
+  def instance_url(id)
+    "https://#{id}.#{ENV['POWERSYNC_DOMAIN'].to_s.strip.then { |d| d.empty? ? DEFAULT_POWERSYNC_DOMAIN : d }}"
+  end
+
+  # Sets KEY=value in a dotenv file: replaces the active line, or appends. Other lines are untouched.
+  # Returns the previous value (nil if the key was absent).
+  def set_env_var(path, key, value)
+    lines = File.file?(path) ? File.readlines(path, chomp: true) : []
+    index = lines.index { |line| line.match?(/\A\s*(export\s+)?#{Regexp.escape(key)}\s*=/) }
+    previous = index && lines[index].split("=", 2)[1].to_s.strip
+    index ? lines[index] = "#{key}=#{value}" : lines << "#{key}=#{value}"
+    File.write(path, lines.join("\n") + "\n")
+    previous
+  end
+
+  # --- Write API (powersync-reference-write-implementation checkout) ---------------------------------------------------------
+
+
+  def write_api_dir
+    File.expand_path(ENV["WRITE_API_DIR"] || "../powersync-reference-write-implementation", HARNESS_ROOT)
+  end
+
+  # The write API's gitignored, optional second env file (its docker-compose.yaml loads .env, then this).
+  # The database password goes here and never into the committed .env.
+  def write_api_env_file
+    File.join(write_api_dir, ".env.local")
+  end
+
+  # Nothing a git checkout would pick up may hold the password: the file must be ignored.
+  def env_local_ignored?(dir)
+    return true unless File.exist?(File.join(dir, ".git")) # not a git checkout: nothing to commit
+    system("git", "-C", dir, "check-ignore", "-q", ".env.local")
+  end
+
+  ENV_LOCAL_VARIABLES = /\A\s+(DATABASE_URI|DATABASE_TYPE|BATCH_ON_FATAL_ERROR|AUTH_[A-Z_]+|HARNESS_[A-Z_]+)\s*:/
+
+  # Compose lets `environment:` entries override `env_file`, so a variable listed there wins over
+  # .env.local and the setting this task writes would be silently ignored.
+  def compose_environment_shadows_env_local(dir)
+    compose = File.join(dir, "docker-compose.yaml")
+    return [] unless File.file?(compose)
+    in_environment = false
+    File.readlines(compose, chomp: true).each_with_object([]) do |line, shadowing|
+      if line =~ /\A(\s*)environment:\s*\z/
+        in_environment = true
+      elsif in_environment && line =~ /\A\s*\S/ && line !~ /\A\s{4,}\S/ # next sibling key ends the block
+        in_environment = false
+      elsif in_environment && line =~ ENV_LOCAL_VARIABLES
+        shadowing << line.strip
+      end
+    end
+  end
+
+  def compose_loads_env_local?(dir)
+    compose = File.join(dir, "docker-compose.yaml")
+    File.file?(compose) && File.read(compose).include?(".env.local")
+  end
+
+  def mask_uri(uri)
+    uri.to_s.sub(%r{(://[^:/@]+:)[^@]*@}, '\\1***@')
+  end
+
+  # True when the write API's committed .env holds a database password (it should not).
+  def tracked_env_has_password?(dir)
+    uri = dotenv(File.join(dir, ".env"))["DATABASE_URI"].to_s
+    !!(uri =~ %r{://[^:/@]+:[^@]+@})
+  end
+
+  # Configures the write API checkout for the harness's current database and tokens:
+  #  1. database settings -> <write api>/.env.local (gitignored there; its Compose file loads it)
+  #  2. the trusted public key -> <write api>/backend/powersync-config.json (gitignored there)
+  #  3. expected issuer/audience -> AUTH_ISSUER / AUTH_AUDIENCE in the same .env.local (the verifier
+  #     reads its supplements from AUTH_* variables; nothing in the checkout's source is edited)
+  def write_api!
+    dir = write_api_dir
+    verifier = File.join(dir, "backend", "src", "auth", "verifier.ts")
+    fail!("No write API checkout at #{dir} (no backend/src/auth/verifier.ts). Set WRITE_API_DIR=/path/to/powersync-reference-write-implementation.") unless File.file?(verifier)
+    fail!("#{dir} reads its verifier supplements from source, not from AUTH_* variables (no backend/src/auth/verifier/env.ts).\n" \
+          "Use a checkout that has supplementsFromEnv (see its backend/src/auth/SETUP.md).") unless File.file?(File.join(dir, "backend", "src", "auth", "verifier", "env.ts"))
+    db = database
+    audience = jwt_audience or fail!("No token audience: set POWERSYNC_URL or JWT_AUDIENCE in backend/.env (rake instance does the former).")
+    issuer = jwt_issuer
+
+    say "Write API checkout: #{dir}"
+
+    # 1. database settings: the gitignored .env.local, never the committed .env
+    fail!("#{File.join(dir, 'docker-compose.yaml')} does not load .env.local, so settings written there would be ignored.\n" \
+          "Its env_file list needs `.env` then an optional `.env.local` (see powersync-reference-write-implementation's README), or use a checkout that has it.") unless compose_loads_env_local?(dir)
+    fail!("#{File.join(dir, '.env.local')} is not gitignored in #{dir}; refusing to put a database password where it could be committed.\n" \
+          "Add `.env.local` to that repo's .gitignore first.") unless env_local_ignored?(dir)
+    shadowed = compose_environment_shadows_env_local(dir)
+    fail!("#{File.join(dir, 'docker-compose.yaml')} lists these under `environment:`, which overrides .env.local:\n" \
+          "  #{shadowed.join("\n  ")}\nDelete those lines so the container takes them from .env / .env.local.") unless shadowed.empty?
+    env_file = write_api_env_file
+    created = !File.file?(env_file)
+    File.write(env_file, "# Generated by `rake write_api` (write-api-harness/powersync/Rakefile). Gitignored: holds the database password.\n" \
+                         "# Overrides .env. HARNESS_* switches and BATCH_ON_FATAL_ERROR can go here too.\n") if created
+    File.chmod(0o600, env_file)
+    previous_uri = set_env_var(env_file, "DATABASE_URI", db.raw_uri)
+    set_env_var(env_file, "DATABASE_TYPE", db.type)
+    # Where the override code's onDeadLetter posts (the frontend's sink); only set if you have not.
+    set_env_var(env_file, "HARNESS_DEAD_LETTER_URL", "http://host.docker.internal:5180/api/dead-letters") unless dotenv(env_file).key?("HARNESS_DEAD_LETTER_URL")
+    note = previous_uri.nil? ? "created" : (previous_uri == db.raw_uri ? "unchanged" : "updated")
+    say "  database:  #{db.type}  #{mask_uri(db.raw_uri)}  -> .env.local (#{note})"
+
+    # 2. trusted key
+    config_path = File.join(dir, "backend", "powersync-config.json")
+    File.write(config_path, JSON.pretty_generate({ "config" => { "client_auth" => { "jwks" => { "keys" => [public_jwk] } } } }) + "\n")
+    say "  key:       #{public_jwk['kid']} -> backend/powersync-config.json"
+
+    # 3. issuer and audience, as the verifier's AUTH_* supplements
+    previous_issuer = set_env_var(env_file, "AUTH_ISSUER", issuer)
+    previous_audience = set_env_var(env_file, "AUTH_AUDIENCE", audience)
+    changed = [[previous_issuer, issuer, "issuer"], [previous_audience, audience, "audience"]].select { |old, new, _| old && old != new }
+    say "  supplements: AUTH_ISSUER=#{issuer}  AUTH_AUDIENCE=#{audience}  -> .env.local" +
+        (changed.empty? ? "" : " (replaced a different #{changed.map(&:last).join(' and ')})")
+
+    if tracked_env_has_password?(dir)
+      say
+      say "WARNING: #{File.join(dir, '.env')} is tracked by git and contains a database password in DATABASE_URI."
+      say "         Remove it before it is committed:  git -C #{dir} checkout .env   (the real settings live in .env.local now)"
+    end
+    say
+    say "Start it:  cd #{dir} && docker compose up --build"
+  end
+
+  # Lists the account's instances (returns false: nothing selected), or with an id or unique id
+  # prefix writes POWERSYNC_URL to backend/.env and frontend/.env (returns true).
+  def select_instance!(selection)
+    instances = cloud_instances
+    fail!("No PowerSync Cloud instances found for this account. Create one in the dashboard first.") if instances.empty?
+
+    unless selection
+      say "Your PowerSync instances:\n\n"
+      instances.each do |i|
+        flags = [i.configured ? nil : "no config", i.provisioned ? nil : "not provisioned"].compact
+        say format("  %-24s  %s / %s%s", i.id, i.project, i.name, flags.empty? ? "" : "   (#{flags.join(', ')})")
+        say "  #{' ' * 24}  org: #{i.org}"
+      end
+      say "\nSelect one:   rake instance INSTANCE=<id>"
+      say "              (an unambiguous id prefix works; zsh also accepts: rake 'instance[<id>]')"
+      return false
+    end
+
+    matches = instances.select { |i| i.id.start_with?(selection) }
+    fail!("No instance matches #{selection.inspect}. Run `rake instance` to list them.") if matches.empty?
+    fail!("#{selection.inspect} matches #{matches.size} instances; give more of the id.") if matches.size > 1
+    chosen = matches.first
+    url = instance_url(chosen.id)
+
+    backend_env_file = File.join(HARNESS_ROOT, "backend", ".env")
+    frontend_env_file = File.join(HARNESS_ROOT, "frontend", ".env")
+    example = File.join(HARNESS_ROOT, "frontend", ".env.example")
+    if !File.file?(frontend_env_file) && File.file?(example)
+      FileUtils.cp(example, frontend_env_file)
+      say "Created frontend/.env from .env.example (set WRITE_API_URL there if it differs)."
+    end
+
+    say "Selected: #{chosen.project} / #{chosen.name}  (#{chosen.id}, org #{chosen.org})"
+    { "backend/.env" => backend_env_file, "frontend/.env" => frontend_env_file }.each do |label, file|
+      previous = set_env_var(file, "POWERSYNC_URL", url)
+      note = previous.nil? ? "added" : (previous == url ? "unchanged" : "was #{previous}")
+      say "  #{label}: POWERSYNC_URL=#{url}  (#{note})"
+    end
+    say "\nThe instance is marked not provisioned by the CLI: its URL may not respond until the first deploy (`rake connect`)." unless chosen.provisioned
+    say "Check the URL once against the PowerSync dashboard; the domain is assumed to be #{DEFAULT_POWERSYNC_DOMAIN} (override: POWERSYNC_DOMAIN=...)."
+    @backend_env = @frontend_env = nil
+    true
+  end
+
+  def pull!
+    FileUtils.mkdir_p(CLI_DIR)
+    cli("pull", "instance", "--instance-id=#{instance_id}", "--directory=#{CLI_DIR_NAME}", "--overwrite") or
+      fail!("`powersync pull instance` failed.")
+  end
+
+  # --- Provisioning (DB side) ---------------------------------------------------------------------
+
+  def provision!
+    db = database
+    tasks = case db.type
+            when "mongodb" then %w[mongo:setup]
+            when "postgres" then %w[db:create db:migrate postgres:publication]
+            when "mssql" then %w[db:create db:migrate mssql:enable_cdc]
+            else %w[db:create db:migrate]
+            end
+    say "Provisioning #{db.type} #{db.host} (#{tasks.join(' ')}) — idempotent."
+    backend_rails(*tasks) or fail!("Provisioning failed (is the database reachable from this machine?).")
+  end
+
+  # --- Reporting and prompts -----------------------------------------------------------------------
+
+  def summary
+    db = database
+    say "Instance:     #{instance_id}"
+    say "Database:     #{db.type}  #{db.user}@#{db.host}:#{db.port}/#{db.name}"
+    say "Client auth:  issuer #{jwt_issuer.inspect}, audience #{jwt_audience.inspect}, key #{public_jwk['kid']}"
+    say "WARNING:      no token audience: set POWERSYNC_URL or JWT_AUDIENCE in backend/.env (the Rails app signs the tokens)." unless jwt_audience
+    if unreachable_from_cloud?(db.host)
+      say "WARNING:      #{db.host} is not reachable from the internet; PowerSync Cloud cannot replicate from it."
+      say "              Point backend/.env at the Terraform database (infra/) before deploying."
+    end
+    other = dotenv(File.join(write_api_dir, ".env")).merge(dotenv(write_api_env_file))
+    theirs = (URI.parse(other["DATABASE_URI"].to_s).host rescue nil)
+    # Only comparable when the write API's settings actually name a database.
+    if theirs && ((other["DATABASE_TYPE"] || "postgres") != db.type || theirs != db.host)
+      say "WARNING:      the write API (#{write_api_dir}) uses #{other['DATABASE_TYPE'] || 'postgres'} #{theirs}, " \
+          "which differs from this database (rake write_api fixes that)."
+    end
+  rescue Failure => e
+    say "(summary incomplete: #{e.message})"
+  end
+
+  def confirm?(question)
+    return true if ENV["YES"] == "1"
+    print "#{question} [y/N] "
+    $stdout.flush
+    $stdin.gets.to_s.strip.downcase.start_with?("y")
+  end
+end
+
+def harness
+  yield
+rescue Harness::Aborted => e
+  warn "\n#{e.message}"
+  exit 1
+rescue Harness::Failure => e
+  warn "\nERROR: #{e.message}"
+  exit 1
+end
+
+task default: :help
+
+desc "Show what this does and the manual steps"
+task :help do
+  puts <<~TEXT
+    rake connect    provision the DB, generate config, dry-run, confirm, deploy to your PowerSync instance
+    rake plan       as connect, without the final deploy
+    rake generate   only write cli/service.yaml and cli/sync-config.yaml
+    rake provision  tables + replication prerequisites in the current database (Docker)
+    rake instance   list your PowerSync instances; INSTANCE=<id> sets POWERSYNC_URL in the .env files
+    rake keys       create the token signing key if needed; print the public JWKS and where it goes
+    rake write_api  configure the write API (../powersync-reference-write-implementation): database, trusted key, issuer/audience
+    rake status     connection/replication status of the instance
+
+    Done by the task: provisioning, config generation (replication connection for the current
+    DATABASE_TYPE/DATABASE_URI, the public token signing key from keys/jwks.json as inline JWKS,
+    the matching Sync Streams config), a diff via `deploy --dry-run`, deploy, status.
+
+    You do by hand (once):
+      1. npm install -g powersync, then `powersync login` (or export PS_ADMIN_TOKEN)
+      2. set DATABASE_TYPE / DATABASE_URI / POWERSYNC_URL (and optionally JWT_ISSUER / JWT_AUDIENCE)
+         in backend/.env, POWERSYNC_URL in frontend/.env (the write API must use the same database;
+         the Rails app issues the tokens, so tokens and PowerSync config come from backend/.env)
+      3. create the database first (infra/, terraform apply); PowerSync Cloud must reach it
+    By hand afterwards: restart the write API after a MongoDB switch (it reads validators at startup),
+    and reload the frontend (clear its site data if it looks stuck on the previous database's rows).
+  TEXT
+end
+
+desc "Write cli/service.yaml and cli/sync-config.yaml for the current database"
+task :generate do
+  harness { Harness.generate! }
+end
+
+desc "List your PowerSync instances; select one with INSTANCE=<id> to set POWERSYNC_URL in backend/.env and frontend/.env"
+task :instance, [:id] do |_task, args|
+  harness do
+    selection = [args[:id], ENV["INSTANCE"]].find { |value| !Harness.blank?(value) }&.strip
+    exit 1 unless Harness.select_instance!(selection)
+  end
+end
+
+desc "Configure the write API checkout (WRITE_API_DIR, default ../powersync-reference-write-implementation) for the current database and tokens"
+task :write_api do
+  harness { Harness.write_api! }
+end
+
+desc "Create the token signing key if needed and print the public JWKS and where to copy it (keys/jwks.json)"
+task :keys do
+  harness do
+    Harness.keys!
+    Harness.say "\nThe public key is in #{Harness.jwks_file}. `rake connect` copies it into the PowerSync instance."
+  end
+end
+
+desc "Create tables and PowerSync prerequisites in the current database"
+task :provision do
+  harness { Harness.provision! }
+end
+
+desc "Pull the live instance config, generate ours, and show what a deploy would change"
+task :plan do
+  harness do
+    Harness.summary
+    Harness.check_login!
+    Harness.provision! unless ENV["SKIP_PROVISION"] == "1"
+    Harness.pull!
+    Harness.generate!
+    Harness.cli("deploy", "--directory=#{CLI_DIR_NAME}", "--dry-run") or Harness.fail!("Dry run failed; nothing was deployed.")
+  end
+end
+
+desc "Point the PowerSync instance at the current database (asks before deploying)"
+task :connect do
+  harness do
+    Rake::Task[:plan].invoke
+    Harness.say
+    raise Harness::Aborted, "Aborted; nothing was deployed." unless Harness.confirm?("Deploy this config to instance #{Harness.instance_id}? Replication restarts against #{Harness.database.host}.")
+    Harness.cli("deploy", "--directory=#{CLI_DIR_NAME}") or Harness.fail!("Deploy failed.")
+    Harness.cli("fetch", "status", "--directory=#{CLI_DIR_NAME}")
+    Harness.say "\nNext: restart the write API if this is MongoDB; reload the frontend. `rake status` shows replication progress."
+  end
+end
+
+desc "Show the instance's connection and replication status"
+task :status do
+  harness do
+    Harness.cli("fetch", "status", "--directory=#{CLI_DIR_NAME}", "--instance-id=#{Harness.instance_id}") or Harness.fail!("Could not fetch status.")
+  end
+end

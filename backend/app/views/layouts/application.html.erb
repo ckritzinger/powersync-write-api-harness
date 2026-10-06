@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Read Oracle</title>
+  <% if @refresh.to_i > 0 %><meta http-equiv="refresh" content="<%= @refresh %>"><% end %>
+  <style>
+    :root { --border:#dde1e7; --muted:#677285; --bad:#c53030; --ok:#1d8a4e; font-family: system-ui, sans-serif; font-size:14px; color:#1c2330; background:#f6f7f9; }
+    body { margin:0; background:#f6f7f9; }
+    header { display:flex; gap:16px; align-items:center; flex-wrap:wrap; padding:10px 16px; background:#fff; border-bottom:1px solid var(--border); }
+    main { padding:16px; }
+    table { border-collapse:collapse; width:100%; background:#fff; }
+    th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+    th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
+    .mono { font-family: ui-monospace, Menlo, monospace; font-size:12px; }
+    .muted { color:var(--muted); }
+    .bad { color:var(--bad); }
+    .ok { color:var(--ok); }
+    a { color:#2f6fde; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Read Oracle</strong>
+    <span class="mono muted"><%= SourceDatabase.description %> · read-only, all owners</span>
+    <a href="<%= root_path(refresh: @refresh) %>">Lists</a>
+    <a href="<%= todos_path(refresh: @refresh) %>">All todos</a>
+    <a href="<%= todos_path(orphaned: 1, refresh: @refresh) %>">Orphaned todos</a>
+    <span class="muted">
+      auto-refresh: <%= @refresh > 0 ? "#{@refresh}s" : "off" %>
+      (<a href="?<%= request.query_parameters.merge("refresh" => @refresh > 0 ? 0 : 3).to_query %>"><%= @refresh > 0 ? "stop" : "start" %></a>)
+      · <a href="<%= url_for(format: :json) %>">JSON</a>
+    </span>
+  </header>
+  <main><%= yield %></main>
+</body>
+</html>

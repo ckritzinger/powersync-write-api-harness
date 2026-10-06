@@ -1,0 +1,17 @@
+# OPTIONAL Compose overlay for powersync-reference-write-implementation. You normally do not need it: run plain
+# `docker compose up --build` in that checkout.
+#
+# The HARNESS_* switches (see README.md here) are ordinary environment variables set in its
+# gitignored .env.local, which its docker-compose.yaml loads; the override code has its own defaults.
+#
+# This overlay only maps host.docker.internal to the host, which the write API uses to reach the
+# frontend's dead-letter sink (HARNESS_DEAD_LETTER_URL). Docker Desktop (macOS, Windows) already
+# provides that name; on Linux add this overlay:
+#
+#   docker compose -f docker-compose.yaml -f /path/to/write-api-overrides/docker-compose.harness.yaml up --build
+#
+# Do not add `environment:` entries for HARNESS_*: they would override .env.local.
+services:
+  backend:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

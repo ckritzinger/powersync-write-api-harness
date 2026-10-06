@@ -1,0 +1,19 @@
+<p class="muted">
+  <%= pluralize(@lists.size, "list") %><%= " for owner #{@owner}" if @owner %>.
+  <% if @orphan_count > 0 %><a class="bad" href="<%= todos_path(orphaned: 1) %>"><%= pluralize(@orphan_count, "orphaned todo") %></a><% end %>
+  <% if @owner %><a href="<%= root_path %>">all owners</a><% end %>
+</p>
+<table>
+  <thead><tr><th>Name</th><th>Owner</th><th>Todos</th><th>Created</th><th>ID</th></tr></thead>
+  <tbody>
+    <% @lists.each do |list| %>
+      <tr>
+        <td><a href="<%= list_path(list.id, refresh: @refresh) %>"><%= list.name.presence || "(blank)" %></a></td>
+        <td class="mono"><a href="<%= root_path(owner: list.owner_id) %>"><%= list.owner_id %></a></td>
+        <td><%= @todo_counts.fetch(list.id.to_s, 0) %></td>
+        <td class="mono"><%= show_value(stored_attrs(list)["created_at"]) %></td>
+        <td class="mono muted"><%= list.id %></td>
+      </tr>
+    <% end %>
+  </tbody>
+</table>

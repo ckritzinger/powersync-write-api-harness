@@ -1,0 +1,12 @@
+# Local run of the read oracle against the source DB (cloud DB from infra/, or any reachable DB).
+services:
+  backend:
+    build: .
+    env_file: .env
+    volumes:
+      # The token signing key (keys/README.md): created on first use, shared with the host.
+      - ../keys:/keys
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

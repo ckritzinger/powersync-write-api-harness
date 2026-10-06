@@ -1,0 +1,15 @@
+# The PowerSync tasks (rake instance / connect / plan / generate / provision / keys / status / write_api) run on
+# the host and need no gems, and live in ../powersync/Rakefile. This Rakefile loads Rails, whose
+# native gems (pg, mysql2, tiny_tds) are only installed inside the Docker image, so loading it on
+# the host fails. Hand those task names to the powersync Rakefile before Rails loads, so
+# `rake instance` works from here too. Anything else is a normal Rails task (`docker compose run
+# --rm backend bin/rails ...`).
+HOST_TASKS = %w[instance connect plan generate provision keys status write_api].freeze
+requested = ARGV.reject { |arg| arg.start_with?("-") || arg.include?("=") }.map { |arg| arg.sub(/\[.*\]\z/, "") }
+if !requested.empty? && requested.all? { |name| HOST_TASKS.include?(name) }
+  warn "(running ../powersync/Rakefile)"
+  exec(RbConfig.ruby, "-S", "rake", "-f", File.expand_path("../powersync/Rakefile", __dir__), *ARGV)
+end
+
+require_relative "config/application"
+Rails.application.load_tasks

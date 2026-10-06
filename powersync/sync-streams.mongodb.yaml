@@ -1,0 +1,11 @@
+# Sync Streams (config edition 3) for a MongoDB source database. Documents use the client's UUID
+# as a string _id, which clients know as `id`. Same scoping as sync-streams.yaml.
+config:
+  edition: 3
+
+streams:
+  user_data:
+    auto_subscribe: true
+    queries:
+      - SELECT _id AS id, owner_id, name, created_at FROM lists WHERE owner_id = auth.user_id()
+      - SELECT _id AS id, list_id, title, completed, position, created_at, updated_at FROM todos WHERE list_id IN (SELECT _id FROM lists WHERE owner_id = auth.user_id())
