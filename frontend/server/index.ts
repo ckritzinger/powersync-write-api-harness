@@ -6,7 +6,7 @@ import { config } from './config.js';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const production = process.env.NODE_ENV === 'production';
 
-// Dead-letter sink: the write-API override of onDeadLetter POSTs here (write-api-overrides/).
+// Dead-letter sink: a write API whose onDeadLetter handler POSTs its entries here shows them in the UI.
 // In memory only; this is an observation window, not storage.
 const deadLetters: { receivedAt: string; entry: unknown }[] = [];
 

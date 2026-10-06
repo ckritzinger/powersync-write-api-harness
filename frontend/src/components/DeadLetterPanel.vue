@@ -39,8 +39,8 @@ const countFor = (txId: number | undefined) => items.value.filter((i) => i.entry
 <template>
   <div>
     <p class="muted">
-      Entries POSTed here by the write API's <span class="mono">onDeadLetter</span> override
-      (<span class="mono">write-api-overrides/fatal-error-handler.ts</span>). All users, in memory, newest first.
+      Entries POSTed to this app's <span class="mono">/api/dead-letters</span> by a write API whose
+      <span class="mono">onDeadLetter</span> handler is set up to do so. All users, in memory, newest first.
     </p>
     <div class="row"><button @click="clear">Clear</button></div>
     <p v-if="!items.length" class="muted">None received.</p>

@@ -2,7 +2,7 @@
 # frontend's user switcher (GET /api/users), and the seed data owners (lib/seed_data.rb).
 # `id` becomes the JWT `sub`, which PowerSync sync streams (auth.user_id()) and the write API's
 # AuthContext see. `role` is an extra claim for custom authorizer experiments
-# (write-api-overrides/authorizer.ts).
+# (for example an authorizer that denies viewers).
 module TestUsers
   User = Struct.new(:id, :name, :role, keyword_init: true)
 

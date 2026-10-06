@@ -67,7 +67,7 @@ function runSequence() {
       </button>
       <button @click="act(() => createSentinelTodo(db, listId!), true)">
         Todo titled __TRIGGER_CONFIRMATION__
-        <small>needs sentinel override → client-directed fatal</small>
+        <small>needs the write API to reject this title → client-directed fatal</small>
       </button>
       <button @click="act(() => createTodoWithNullTitle(db, listId!), true)">
         Todo with null title

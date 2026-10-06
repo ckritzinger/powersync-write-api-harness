@@ -3,7 +3,10 @@ import type { AbstractPowerSyncDatabase } from '@powersync/web';
 // Every helper here is a local write; the SDK queues it and the connector uploads it.
 // Transaction boundaries are deliberate: each exported function is one upload transaction.
 
-/** Sentinel the write-API override (write-api-overrides/) turns into USER_CONFIRMATION_REQUIRED. */
+/**
+ * Sentinel title for the client-directed fatal path (TestPlan §7): the write API under test must throw
+ * FatalOperationError('USER_CONFIRMATION_REQUIRED', ...) for it, from its authorizer or mapper.
+ */
 export const CONFIRMATION_SENTINEL = '__TRIGGER_CONFIRMATION__';
 
 export const uuid = () => crypto.randomUUID();
@@ -79,7 +82,7 @@ export async function createTodoWithNullTitle(db: AbstractPowerSyncDatabase, lis
   await createTodo(db, listId, null);
 }
 
-/** Client-directed path: needs the sentinel override applied to the write API. */
+/** Client-directed path: only fails if the write API is configured to reject the sentinel title. */
 export async function createSentinelTodo(db: AbstractPowerSyncDatabase, listId: string) {
   await createTodo(db, listId, CONFIRMATION_SENTINEL);
 }
