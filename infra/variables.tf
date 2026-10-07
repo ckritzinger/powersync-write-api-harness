@@ -46,6 +46,15 @@ variable "db_instance_class" {
   default = "db.t3.micro"
 }
 
+variable "sqlserver_instance_class" {
+  description = <<-EOT
+    Instance class when engine = sqlserver. Standard edition (needed for CDC) has no micro class; db.m5.large is
+    the smallest offered for 16.00 and costs far more per hour than db.t3.micro. License is included in the price.
+  EOT
+  type        = string
+  default     = "db.m5.large"
+}
+
 variable "postgres_force_ssl" {
   description = <<-EOT
     Require TLS on RDS Postgres. The write API's Postgres persister ignores sslmode in DATABASE_URI,

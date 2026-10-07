@@ -2,9 +2,11 @@ locals {
   rds_enabled = var.engine != "none"
 
   engine_settings = {
-    postgres  = { engine = "postgres", version = "16", port = 5432, family = "postgres16", scheme = "postgres" }
-    mysql     = { engine = "mysql", version = "8.4", port = 3306, family = "mysql8.4", scheme = "mysql" }
-    sqlserver = { engine = "sqlserver-ex", version = "16.00", port = 1433, family = "sqlserver-ex-16.0", scheme = "mssql" }
+    postgres = { engine = "postgres", version = "16", port = 5432, family = "postgres16", scheme = "postgres" }
+    mysql    = { engine = "mysql", version = "8.4", port = 3306, family = "mysql8.4", scheme = "mysql" }
+    # Standard, not Express: PowerSync's SQL Server source needs CDC, which RDS offers only on Standard and
+    # Enterprise. Standard has no free-tier class; see var.sqlserver_instance_class.
+    sqlserver = { engine = "sqlserver-se", version = "16.00", port = 1433, family = "sqlserver-se-16.0", scheme = "mssql" }
   }
   db = local.rds_enabled ? local.engine_settings[var.engine] : null
 
@@ -78,7 +80,7 @@ resource "aws_db_instance" "main" {
   identifier             = "${var.name}-${var.engine}"
   engine                 = local.db.engine
   engine_version         = local.db.version
-  instance_class         = var.db_instance_class
+  instance_class         = var.engine == "sqlserver" ? var.sqlserver_instance_class : var.db_instance_class
   allocated_storage      = 20
   storage_type           = "gp2"
   db_name                = var.engine == "sqlserver" ? null : var.db_name

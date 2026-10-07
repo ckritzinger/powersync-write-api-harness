@@ -6,7 +6,7 @@
 //   W=../powersync-reference-write-implementation/backend/src
 //   cp write-api-overrides/harness-mapper.ts $W/mapping/harness.ts
 //
-// and in $W/persistance/persister-factories.ts:
+// and in $W/persistence/persister-factories.ts:
 //
 //   import { harnessMapper } from '../mapping/harness.js';
 //   ...
