@@ -10,3 +10,15 @@ services:
       - "3000:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Opt-in: `docker compose --profile tunnel up`. Serves ONLY the public JWKS on :3001, so that is the port to
+  # tunnel with ngrok instead of :3000 (which would expose the token endpoint and the data view). See the Caddyfile.
+  jwks-proxy:
+    profiles: ["tunnel"]
+    image: caddy:2-alpine
+    depends_on:
+      - backend
+    volumes:
+      - ./jwks-proxy.Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "3001:3001"

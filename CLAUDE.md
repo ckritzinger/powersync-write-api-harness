@@ -3,6 +3,16 @@
 Manual test harness for the PowerSync reference write implementation (`../powersync-reference-write-implementation`,
 called "the write API"). `README.md` is the quick start; this file is what you need to change things safely.
 
+## Test order: read first, then write
+
+The user always sets up and verifies the **read path in isolation, before the write API is running at all**. Whenever you
+write or change instructions (README steps, task output, runbooks, answers about setup), keep this order:
+database → PowerSync connected (`rake connect`) → Rails app → frontend → **confirm reads** (`sync: connected`, each
+user's lists, matching the Rails oracle) → only then configure and start the write API (`rake write_api`, then
+`docker compose up` in its repo) → confirm writes. Never put the write API before the frontend and the Rails app, never
+start it "to be ready", and never debug a read problem by involving it. In the read-only phase an `upload error` badge is
+expected: edits queue locally and upload once the write API starts.
+
 ## Layout
 
 | Dir | What | Runs |
@@ -40,6 +50,9 @@ There is no automated test suite. Verify Rails changes by building the image
 - **Rails signs every token** (`TestUsers`, `SigningKey`, `TokenIssuer`). `TestUsers` is the single
   source of users (token subjects, frontend dropdown, seed owners). `?mode=` on `/api/auth/token` makes
   deliberately broken tokens for curl testing; the browser app only ever sends valid ones.
+- **Never tunnel the Rails app (`:3000`) with ngrok.** It hands a valid token to anyone naming a test user and shows every
+  row. The opt-in `jwks-proxy` Compose service (`--profile tunnel`, `backend/jwks-proxy.Caddyfile`) forwards only
+  `GET`/`HEAD /.well-known/jwks.json` and 404s the rest; tunnel its port `3001`. Keep it deny-by-default.
 - **Sync Streams (config edition 3), not Sync Rules.** One auto-subscribed stream, scoped by `auth.user_id()`.
 - **Postgres TLS:** PowerSync Cloud requires verified TLS (the Rakefile embeds the RDS CA bundle), but the
   write API's Postgres connection cannot use TLS, so Terraform turns `rds.force_ssl` off. Throwaway databases only.
@@ -73,7 +86,8 @@ There is no automated test suite. Verify Rails changes by building the image
 The database bills until `infra/scripts/teardown.sh` runs (`AWS_PROFILE` must be exported; the script also copes with
 a profile that has no default region, falling back to `us-east-1`). It runs `terraform destroy`, then a **read-only** account-wide check that never deletes: the user chose that
 over a deleting sweep, so do not add deletion. A failed AWS query must never produce a "Clean" verdict. Keep it
-compatible with bash 3.2 (macOS), and remember the interactive shell is zsh (unquoted variables are not word-split).
+compatible with bash 3.2 (macOS), and remember the interactive shell is zsh: unquoted variables are not word-split, and a
+variable named `path` is tied to `PATH` (name loop variables something else, or commands vanish).
 
 ## Known engine behaviours
 

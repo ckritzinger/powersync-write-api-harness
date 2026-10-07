@@ -1,0 +1,29 @@
+# Public face of the Rails app, for tunnelling (ngrok): serves the signing key's public JWKS and NOTHING else.
+#
+# Do not tunnel the Rails app itself (port 3000): it also hands a valid token to anyone who names a test user
+# and shows every row in the database, all unauthenticated. Tunnel this proxy instead:
+#
+#   docker compose --profile tunnel up         # starts it on :3001 beside the Rails app
+#   ngrok http 3001                            # then use https://<your-domain>/.well-known/jwks.json
+#
+# Deny by default: only GET/HEAD on exactly this path is forwarded; every other request gets a 404 here and
+# never reaches Rails. This container mounts no key files (the private key is not reachable from it); it only
+# forwards to the Rails app, which creates the key on first use.
+{
+	admin off
+	auto_https off
+}
+
+:3001 {
+	@jwks {
+		method GET HEAD
+		path /.well-known/jwks.json
+	}
+	handle @jwks {
+		header Cache-Control "public, max-age=300"
+		reverse_proxy backend:3000
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

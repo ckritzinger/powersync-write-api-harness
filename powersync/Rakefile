@@ -467,6 +467,7 @@ module Harness
     end
     say
     say "Start it:  cd #{dir} && docker compose up --build"
+    say "(Only after reads work: the Rails app and frontend running, `sync: connected`, each user's lists correct.)"
   end
 
   # Lists the account's instances (returns false: nothing selected), or with an id or unique id
@@ -515,6 +516,8 @@ module Harness
 
   def pull!
     FileUtils.mkdir_p(CLI_DIR)
+    # `pull` leaves an existing cli.yaml alone; one linking a previous instance would redirect `deploy` to it.
+    FileUtils.rm_f(File.join(CLI_DIR, "cli.yaml"))
     cli("pull", "instance", "--instance-id=#{instance_id}", "--directory=#{CLI_DIR_NAME}", "--overwrite") or
       fail!("`powersync pull instance` failed.")
   end
@@ -588,6 +591,10 @@ task :help do
     rake write_api  configure the write API (../powersync-reference-write-implementation): database, trusted key, issuer/audience
     rake status     connection/replication status of the instance
 
+    Order: always test reading before writing. Everything above except `write_api` belongs to the read
+    path: create the database, `provision`, `connect`, start the Rails app and the frontend, and confirm
+    reads work. Only then run `write_api` and start the write API (its edits just queue until it is up).
+
     Done by the task: provisioning, config generation (replication connection for the current
     DATABASE_TYPE/DATABASE_URI, the public token signing key from keys/jwks.json as inline JWKS,
     the matching Sync Streams config), a diff via `deploy --dry-run`, deploy, status.
@@ -642,7 +649,7 @@ task :plan do
     Harness.provision! unless ENV["SKIP_PROVISION"] == "1"
     Harness.pull!
     Harness.generate!
-    Harness.cli("deploy", "--directory=#{CLI_DIR_NAME}", "--dry-run") or Harness.fail!("Dry run failed; nothing was deployed.")
+    Harness.cli("deploy", "--directory=#{CLI_DIR_NAME}", "--instance-id=#{Harness.instance_id}", "--dry-run") or Harness.fail!("Dry run failed; nothing was deployed.")
   end
 end
 
@@ -652,7 +659,7 @@ task :connect do
     Rake::Task[:plan].invoke
     Harness.say
     raise Harness::Aborted, "Aborted; nothing was deployed." unless Harness.confirm?("Deploy this config to instance #{Harness.instance_id}? Replication restarts against #{Harness.database.host}.")
-    Harness.cli("deploy", "--directory=#{CLI_DIR_NAME}") or Harness.fail!("Deploy failed.")
+    Harness.cli("deploy", "--directory=#{CLI_DIR_NAME}", "--instance-id=#{Harness.instance_id}") or Harness.fail!("Deploy failed.")
     Harness.cli("fetch", "status", "--directory=#{CLI_DIR_NAME}")
     Harness.say "\nNext: restart the write API if this is MongoDB; reload the frontend. `rake status` shows replication progress."
   end

@@ -10,12 +10,12 @@ variable "name" {
 }
 
 variable "engine" {
-  description = "Source DB engine to run on RDS: postgres | mysql | sqlserver | none (none = MongoDB on Atlas, see infra/atlas)."
+  description = "Source DB engine to run on RDS: postgres | mysql | mariadb | sqlserver | none (none = MongoDB on Atlas, see infra/atlas)."
   type        = string
   default     = "postgres"
   validation {
-    condition     = contains(["postgres", "mysql", "sqlserver", "none"], var.engine)
-    error_message = "engine must be postgres, mysql, sqlserver or none."
+    condition     = contains(["postgres", "mysql", "mariadb", "sqlserver", "none"], var.engine)
+    error_message = "engine must be postgres, mysql, mariadb, sqlserver or none."
   }
 }
 
