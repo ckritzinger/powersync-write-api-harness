@@ -93,8 +93,13 @@ variable named `path` is tied to `PATH` (name loop variables something else, or 
 
 MySQL rejects JavaScript's `...Z` timestamps and the write API's default mapper does no conversion, so the client sends
 `+00:00`. SQL Server columns are `datetimeoffset(3)`. MongoDB has no foreign keys (a bad `list_id` succeeds) and
-needs `$jsonSchema` validators (`rake mongo:setup`). Only Postgres/RDS has been exercised against a real
-PowerSync instance; MySQL, SQL Server and MongoDB settings are unverified.
+needs `$jsonSchema` validators (`rake mongo:setup`). Postgres/RDS and MySQL 8.4/RDS have been exercised
+end to end (reads and writes) against a real PowerSync instance; SQL Server and MongoDB settings are unverified.
+
+**MariaDB does not work.** PowerSync's MySQL connector fails its connection test on RDS MariaDB 10.11 with
+`Unknown system variable 'gtid_mode'`, so replication cannot start. The harness has no MariaDB engine; an
+attempt (RDS `mariadb` in Terraform, `type: mysql`) was reverted. RDS MariaDB also defaults to latin1, which
+rejects the seed data's non-ASCII titles.
 
 ## Conventions
 

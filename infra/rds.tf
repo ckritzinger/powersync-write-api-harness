@@ -2,11 +2,8 @@ locals {
   rds_enabled = var.engine != "none"
 
   engine_settings = {
-    postgres = { engine = "postgres", version = "16", port = 5432, family = "postgres16", scheme = "postgres" }
-    mysql    = { engine = "mysql", version = "8.4", port = 3306, family = "mysql8.4", scheme = "mysql" }
-    # PowerSync has no MariaDB connector; it replicates MariaDB through its MySQL one (type: mysql), so the
-    # scheme stays "mysql" for the Rails app and the write API.
-    mariadb   = { engine = "mariadb", version = "10.11", port = 3306, family = "mariadb10.11", scheme = "mysql" }
+    postgres  = { engine = "postgres", version = "16", port = 5432, family = "postgres16", scheme = "postgres" }
+    mysql     = { engine = "mysql", version = "8.4", port = 3306, family = "mysql8.4", scheme = "mysql" }
     sqlserver = { engine = "sqlserver-ex", version = "16.00", port = 1433, family = "sqlserver-ex-16.0", scheme = "mssql" }
   }
   db = local.rds_enabled ? local.engine_settings[var.engine] : null
@@ -23,10 +20,6 @@ locals {
       { name = "binlog_format", value = "ROW", apply_method = "immediate" },
       { name = "gtid-mode", value = "ON", apply_method = "pending-reboot" },
       { name = "enforce_gtid_consistency", value = "ON", apply_method = "pending-reboot" }
-    ]
-    # GTID is always on in MariaDB (no gtid-mode parameter).
-    mariadb = [
-      { name = "binlog_format", value = "ROW", apply_method = "immediate" }
     ]
     sqlserver = []
   }
@@ -97,8 +90,8 @@ resource "aws_db_instance" "main" {
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.db.id]
   publicly_accessible    = true
-  # MySQL/MariaDB binlog replication needs automated backups; 1 day stays within the free tier.
-  backup_retention_period = contains(["mysql", "mariadb"], var.engine) ? 1 : 0
+  # MySQL binlog replication needs automated backups; 1 day stays within the free tier.
+  backup_retention_period = var.engine == "mysql" ? 1 : 0
   apply_immediately       = true
   skip_final_snapshot     = true
   deletion_protection     = false

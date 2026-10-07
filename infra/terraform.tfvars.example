@@ -1,5 +1,5 @@
 region = "us-east-1"
-engine = "postgres" # postgres | mysql | mariadb | sqlserver | none (MongoDB on Atlas, see atlas/)
+engine = "postgres" # postgres | mysql | sqlserver | none (MongoDB on Atlas, see atlas/)
 
 # Optional: the DB port is open to 0.0.0.0/0 by default (throwaway databases). To narrow it:
 # db_ingress_cidrs = ["203.0.113.7/32", "<PowerSync egress IP>/32"]
