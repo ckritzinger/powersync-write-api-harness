@@ -4,6 +4,10 @@
 default: &default
   url: <%= SourceDatabase.active_record_url %>
   pool: 5
+<% if SourceDatabase.type == "mssql" %>
+  # sp_cdc_enable_table creates capture jobs and can exceed TinyTDS's short default statement timeout.
+  timeout: 300000
+<% end %>
 
 development:
   <<: *default

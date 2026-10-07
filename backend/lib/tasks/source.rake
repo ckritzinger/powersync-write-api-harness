@@ -73,7 +73,7 @@ namespace :postgres do
 end
 
 namespace :mssql do
-  desc "Enable CDC on the database and the lists/todos tables (needed by PowerSync's SQL Server source)"
+  desc "Enable CDC on the database, the lists/todos tables and the _powersync_checkpoints table (needed by PowerSync's SQL Server source)"
   task enable_cdc: :environment do
     conn = ActiveRecord::Base.connection
     abort "DATABASE_TYPE is not mssql" unless conn.adapter_name.match?(/sqlserver/i)
@@ -83,7 +83,16 @@ namespace :mssql do
       on_rds = conn.select_value("SELECT OBJECT_ID('msdb.dbo.rds_cdc_enable_db')").present?
       conn.execute(on_rds ? "EXEC msdb.dbo.rds_cdc_enable_db #{conn.quote(db_name)}" : "EXEC sys.sp_cdc_enable_db")
     end
-    %w[lists todos].each do |table|
+    # PowerSync's SQL Server source writes to this table to produce replication checkpoints, and requires
+    # CDC on it too. Definition from the PowerSync SQL Server setup docs.
+    conn.execute(<<~SQL)
+      IF OBJECT_ID(N'dbo._powersync_checkpoints', N'U') IS NULL
+      CREATE TABLE dbo._powersync_checkpoints (
+        id INT IDENTITY PRIMARY KEY,
+        last_updated DATETIME NOT NULL DEFAULT GETUTCDATE()
+      )
+    SQL
+    %w[lists todos _powersync_checkpoints].each do |table|
       tracked = conn.select_value("SELECT is_tracked_by_cdc FROM sys.tables WHERE name = #{conn.quote(table)}")
       next if tracked == true
       conn.execute("EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = #{conn.quote(table)}, @role_name = NULL, @supports_net_changes = 0")
