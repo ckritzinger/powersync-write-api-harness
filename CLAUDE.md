@@ -61,6 +61,8 @@ There is no automated test suite. Verify Rails changes by building the image
   `fake_title` uploads a PATCH for a table and column the source lacks. It only succeeds if the write API's mapper
   handles both renames. Do not "fix" it by creating the table. Streams cannot select columns from two tables, so a
   real joined/denormalised table is not possible there. The MongoDB stream variant does not have it yet.
+  `write-api-overrides/harness-mapper.ts` is an optional write API mapper that makes the edit succeed; its header
+  says how to copy it in and remove it. The write API checkout is never committed with it.
 - **No error-path overrides ship with the harness.** The sentinel todo and foreign-owner write only fail if
   the write API itself is set up to reject them (TestPlan §7).
 
