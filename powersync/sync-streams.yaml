@@ -14,3 +14,4 @@ streams:
     queries:
       - SELECT * FROM lists WHERE owner_id = auth.user_id()
       - SELECT * FROM todos WHERE list_id IN (SELECT id FROM lists WHERE owner_id = auth.user_id())
+      - SELECT *, title AS fake_title FROM todos AS expanded_todos WHERE list_id IN (SELECT id FROM lists WHERE owner_id = auth.user_id())

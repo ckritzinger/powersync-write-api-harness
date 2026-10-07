@@ -66,6 +66,14 @@ export async function deleteTodo(db: AbstractPowerSyncDatabase, id: string) {
   await db.execute('DELETE FROM todos WHERE id = ?', [id]);
 }
 
+/**
+ * Edits the alias column of the expanded_todos stream. Neither the table nor the column exists in the source
+ * database, so this only succeeds if the write API maps both (TestPlan: mapper with renamed table and column).
+ */
+export async function updateExpandedFakeTitle(db: AbstractPowerSyncDatabase, id: string, fakeTitle: string) {
+  await db.execute('UPDATE expanded_todos SET fake_title = ? WHERE id = ?', [fakeTitle, id]);
+}
+
 // Debug actions (TestPlan §3, §4, §6)
 
 /** Natural DB failure: FK violation on SQL engines (no FK in MongoDB, so it succeeds there). */

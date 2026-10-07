@@ -56,6 +56,11 @@ There is no automated test suite. Verify Rails changes by building the image
 - **Sync Streams (config edition 3), not Sync Rules.** One auto-subscribed stream, scoped by `auth.user_id()`.
 - **Postgres TLS:** PowerSync Cloud requires verified TLS (the Rakefile embeds the RDS CA bundle), but the
   write API's Postgres connection cannot use TLS, so Terraform turns `rds.force_ssl` off. Throwaway databases only.
+- **`expanded_todos` is deliberately not a source table.** `sync-streams.yaml` serves `todos` a second time as
+  `SELECT *, title AS fake_title FROM todos AS expanded_todos`, and the client schema declares it, so editing
+  `fake_title` uploads a PATCH for a table and column the source lacks. It only succeeds if the write API's mapper
+  handles both renames. Do not "fix" it by creating the table. Streams cannot select columns from two tables, so a
+  real joined/denormalised table is not possible there. The MongoDB stream variant does not have it yet.
 - **No error-path overrides ship with the harness.** The sentinel todo and foreign-owner write only fail if
   the write API itself is set up to reject them (TestPlan §7).
 

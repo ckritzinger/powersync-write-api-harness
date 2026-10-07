@@ -6,6 +6,7 @@ import { useSession } from './session';
 import { connect, disconnect, flushOnce } from './powersync/db';
 import ListsPane from './components/ListsPane.vue';
 import TodosPane from './components/TodosPane.vue';
+import ExpandedTodosPane from './components/ExpandedTodosPane.vue';
 import DebugPanel from './components/DebugPanel.vue';
 import FatalPanel from './components/FatalPanel.vue';
 import QueuePanel from './components/QueuePanel.vue';
@@ -77,7 +78,10 @@ const unreleasedFatals = () => harness.clientFatals.filter((f) => !f.released).l
 
   <main class="layout">
     <ListsPane v-model:selected="selectedListId" />
-    <TodosPane :list-id="selectedListId" />
+    <div class="stack">
+      <TodosPane :list-id="selectedListId" />
+      <ExpandedTodosPane :list-id="selectedListId" />
+    </div>
     <section class="panel side">
       <nav class="tabs">
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
@@ -125,6 +129,11 @@ const unreleasedFatals = () => harness.clientFatals.filter((f) => !f.released).l
   .layout {
     grid-template-columns: 1fr;
   }
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .tabs {
   display: flex;
